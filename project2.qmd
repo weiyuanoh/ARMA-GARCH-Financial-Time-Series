@@ -1,0 +1,600 @@
+---
+title: "FN6811: Analysis of SSE Composite Index Return Dynamics and Volatility"
+author: "Wei Yuan Oh, G2500601C"
+output: 
+  pdf_document: 
+    number_sections: true
+    toc: true
+    highlight: tango
+format:
+  pdf:
+    documentclass: article      # or amsart, scrartcl, etc.
+    classoption: [11pt]
+    geometry: "margin=1in"
+    fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  message = FALSE, 
+  warning = FALSE, 
+  fig.align = 'center', 
+  fig.width = 7, 
+  fig.height = 4.5
+)
+
+library(tidyverse)
+library(lubridate)
+library(xts)
+library(readxl)
+library(rugarch)
+library(tseries)
+library(forecast)
+library(FinTS)
+library(PerformanceAnalytics)
+library(knitr)
+library(lmtest) 
+library(janitor)
+```
+
+# 1. Introduction and Data Preparation
+
+## 1.1 Assignment Context
+
+This report supports the company's initiative to invest in the Shanghai Pilot Free Trade Zone (SPFTZ). We aim to construct a portfolio replicating the Shanghai Stock Exchange (SSE) Composite Index. The objective is to model the return dynamics and volatility of the SSE using a rigorous **Joint Estimation** methodology to select the optimal model.
+
+## 1.2 Data Ingestion and Transformation
+
+We analyze the daily closing prices from January 2, 2008, to October 15, 2025. We calculate **daily log returns** ($R_t$):
+
+$$
+R_{t} = 100 \times \ln\left(\frac{PRICE_t}{PRICE_{t-1}}\right)
+$$
+
+```{r data_preparation}
+filename <- "SSE_Jan2008_Oct2025.xlsx"
+
+raw_data <- suppressWarnings(
+  read_excel(filename, col_types = c("text", "text"))
+)
+names(raw_data) <- c("Date", "Price")
+
+df <- raw_data %>%
+  mutate(
+    Price = as.numeric(Price),
+    Date_clean = str_remove(Date, "\\s.*$"), 
+    
+    Date_Parsed = case_when(
+
+      str_detect(Date_clean, "/") ~ mdy(Date_clean),
+      
+      str_detect(Date_clean, "-") ~ ydm(Date_clean),
+      
+      str_detect(Date_clean, "^[0-9]+$") ~ {
+        d_temp <- as.Date(as.numeric(Date_clean), origin = "1899-12-30")
+        d_str <- format(d_temp, "%Y-%m-%d")
+        ydm(d_str)
+      },
+      
+      TRUE ~ as.Date(NA)
+    )
+  ) %>%
+  filter(!is.na(Date_Parsed)) %>%
+  filter(Date_Parsed <= as.Date("2025-10-31")) %>%
+  arrange(Date_Parsed) %>%
+  distinct(Date_Parsed, .keep_all = TRUE)
+
+df <- df %>%
+  mutate(
+    ln_price = log(Price),
+    Return = 100 * (ln_price - lag(ln_price))
+  ) %>%
+  drop_na()
+
+sse_xts <- xts(df$Return, order.by = df$Date_Parsed)
+colnames(sse_xts) <- "SSE_Return"
+
+# --- Verification ---
+cat(sprintf("Rows processed: %d\n", nrow(df)))
+cat(sprintf("Date Range: %s to %s\n", min(index(sse_xts)), max(index(sse_xts))))
+head(sse_xts)
+tail(sse_xts)
+```
+
+## 1.3 Train-Test Split (70:30)
+
+To ensure our model is robust for investment decisions, we strictly separate the data into:
+
+1. **Training Set (70%)**: Used for Identification, Joint Estimation, and Model Selection.  
+2. **Testing Set (30%)**: Used exclusively for Forecasting and Out-of-Sample Evaluation.
+
+```{r train_test_split}
+# Determine split index
+n_total <- length(sse_xts)
+n_train <- floor(0.70 * n_total) # 70% for training
+n_test  <- n_total - n_train     # 30% for testing (holdout)
+
+# Create Subsets
+sse_train <- sse_xts[1:n_train, ]
+sse_test  <- sse_xts[(n_train + 1):n_total, ]
+
+# Visualize Split
+par(mar = c(3, 4, 3, 1)) 
+plot(
+  sse_xts,
+  main          = "Figure 1: Train (Black) vs Test (Red) Split", 
+  major.ticks   = "years",
+  grid.ticks.on = "years",
+  col           = "red",
+  yaxis.right   = FALSE
+)
+lines(sse_train, col = "black")
+legend(
+  "topright",
+  legend = c("Training Set", "Testing Set"),
+  col    = c("black", "red"),
+  lty    = 1,
+  cex    = 0.8,
+  bty    = "n"
+)
+
+cat(sprintf(
+  "Training Data: %d observations\nTesting Data: %d observations", 
+  length(sse_train), length(sse_test)
+))
+```
+
+# 2. Statistical Properties (Training Set)
+
+We perform all statistical checks on the **Training Set** only.
+
+## 2.1 Descriptive Statistics & Normality
+
+```{r descriptive_stats}
+# Calculate Stats on TRAIN
+stats <- table.Stats(sse_train)
+kable(stats, caption = "Descriptive Statistics (Training Set)")
+
+# Kurtosis Check
+kurt_val <- kurtosis(sse_train)
+cat("Excess Kurtosis:", kurt_val, "\n")
+```
+
+**Decision:** The Training data shows significant Excess Kurtosis (`r round(kurt_val, 2)`). We reject Normality and will use the **Student-t distribution** in our GARCH models, using QML for parameter estimation rather than relying on strict Gaussian MLE assumptions.
+
+## 2.2 Stationarity Test (ADF)
+
+```{r stationarity_test}
+
+adf_res <- adf.test(sse_train)
+print(adf_res)
+```
+
+**Conclusion:** The p-value is $< 0.05$. The Training series is **stationary**, so no further differencing is required.
+
+# 3. Mean Equation Identification
+
+We inspect the correlograms of the Training set to identify plausible Mean Equation candidates.
+
+```{r model_identification}
+
+par(mfrow = c(1, 2))
+acf(sse_train,  main = "ACF (Training)",  lag.max = 20)
+pacf(sse_train, main = "PACF (Training)", lag.max = 20)
+par(mfrow = c(1, 1))
+```
+
+**Interpretation:**
+
+- The significant spike at PACF lag 1 suggests an AR(1).  
+- The ACF decay pattern suggests possible ARMA structure.  
+- **Candidates:** We will test a family of mean models: **AR(1), MA(1), ARMA(1,1)** paired with GARCH-type volatility components.
+
+# 4. Formal Test for ARCH Effects (Baseline Mean Model)
+
+Before proceeding to GARCH-type volatility modelling, we formally confirm that **volatility clustering (ARCH effects)** exists in the residuals of a simple mean equation.
+
+We fit a baseline **AR(1)** model and apply the **ARCH Lagrange Multiplier (LM) Test** and residual correlograms to its residuals.
+
+```{r arch_effect_test}
+
+mean_model_baseline <- arima(as.numeric(sse_train), order = c(1, 0, 0))
+
+
+resids_baseline <- residuals(mean_model_baseline)
+
+
+# H0: No ARCH effects (Homoskedasticity)
+# H1: ARCH effects present (Heteroskedasticity)
+arch_test_res <- ArchTest(resids_baseline, lags = 12)
+print(arch_test_res)
+
+
+par(mfrow = c(1, 2))
+acf(resids_baseline,   main = "ACF of AR(1) Residuals",        lag.max = 20)
+acf(resids_baseline^2, main = "ACF of Squared AR(1) Residual", lag.max = 20)
+par(mfrow = c(1, 1))
+```
+
+**Conclusion:** The ARCH-LM test yields a p-value $< 0.05$, and the correlogram of squared residuals shows significant autocorrelation. We therefore **reject the null of no ARCH effects**:
+
+- There is statistically significant **volatility clustering** in the residuals of the AR(1) model.  
+- **Implication:** A constant-variance AR/ARMA model is inadequate; we proceed to **GARCH-type models** for the conditional variance.
+
+# 5. Joint Model Selection 
+
+Having confirmed the need for GARCH, we now test **Joint Mean–Variance specifications**. To remain within the course scope, we restrict volatility models to:
+
+- **GARCH(1,1)** (rugarch: `sGARCH`)  
+- **GJR-GARCH(1,1)** (rugarch: `gjrGARCH`)  
+- **EGARCH(1,1)** (rugarch: `eGARCH`)  
+- **GARCH-in-Mean** (volatility enters the mean equation; risk–return trade-off)
+
+To strengthen identification, we run a compact grid:
+
+- Mean equations: **AR(1), MA(1), ARMA(1,1)**  
+- Volatility models: **GARCH, GJR-GARCH, EGARCH**  
+- Plus **GARCH-M** variants paired with each mean equation.
+
+**Selection Rule (Course-Aligned, High-Impact):**
+
+Because daily return predictability in the mean is typically weak (so RMSE differences are often tiny), we select the final model using a *diagnostics-first* approach:
+
+1. **Model Adequacy Filter (Primary):** Keep only models whose **standardized residuals** pass:
+   - Ljung–Box test: no remaining serial correlation (p-value > 0.05)
+   - ARCH-LM test: no remaining ARCH effects (p-value > 0.05)
+2. **Parsimony (Primary Tie-Breaker):** Among models that pass (1), choose the **lowest BIC**.
+3. **Forecast sanity check (Secondary):** Report test-set **RMSE** of the fitted conditional mean as an additional check, but it is not the main driver.
+
+```{r Model Selection}
+
+# Mean models
+mean_grid <- list(
+  "AR1"    = c(1, 0),
+  "MA1"    = c(0, 1),
+  "ARMA11" = c(1, 1)
+)
+
+# Vol models
+vol_grid <- list(
+  "GARCH"  = "sGARCH",    # standard GARCH(1,1)
+  "GJR"    = "gjrGARCH",  # leverage/asymmetry
+  "EGARCH" = "eGARCH"     # log-variance asymmetry
+)
+
+# Build candidate set
+combos <- list()
+
+# 9 base models
+for (mname in names(mean_grid)) {
+  for (vname in names(vol_grid)) {
+    model_name <- paste0(mname, "-", vname)
+    combos[[model_name]] <- list(
+      arma    = mean_grid[[mname]],
+      garch   = vol_grid[[vname]],
+      archm   = FALSE,
+      archpow = 1
+    )
+  }
+}
+
+
+for (mname in names(mean_grid)) {
+  model_name <- paste0(mname, "-GARCHM")
+  combos[[model_name]] <- list(
+    arma    = mean_grid[[mname]],
+    garch   = "sGARCH",
+    archm   = TRUE,
+    archpow = 1
+  )
+}
+
+
+sse_train_vec <- as.numeric(sse_train)
+
+safe_ugarchfit <- function(spec, data) {
+  solvers <- c("hybrid", "solnp", "gosolnp")
+  for (s in solvers) {
+    fit_try <- tryCatch(
+      ugarchfit(
+        spec = spec,
+        data = data,
+        solver = s,
+        fit.control = list(stationarity = 1, fixed.se = 0, scale = 1),
+        solver.control = list(trace = 0)
+      ),
+      error = function(e) e
+    )
+    if (!inherits(fit_try, "error")) return(fit_try)
+  }
+  return(NULL)
+}
+
+apply_starts <- function(spec, spec_def) {
+  if (spec_def$garch == "sGARCH") {
+    if (isTRUE(spec_def$archm)) {
+      setstart(spec) <- list(omega = 0.1, alpha1 = 0.05, 
+                             beta1 = 0.90, archm = 0.0)
+    } else {
+      setstart(spec) <- list(omega = 0.1, alpha1 = 0.05, beta1 = 0.90)
+    }
+  } else if (spec_def$garch == "gjrGARCH") {
+    setstart(spec) <- list(omega = 0.1, alpha1 = 0.05, 
+                           beta1 = 0.85, gamma1 = 0.05)
+  } else if (spec_def$garch == "eGARCH") {
+    setstart(spec) <- list(omega = -0.1, alpha1 = 0.10, 
+                           beta1 = 0.90, gamma1 = 0.05)
+  }
+  spec
+}
+
+results <- data.frame(
+  Model     = character(),
+  BIC       = numeric(),
+  RMSE      = numeric(),
+  LB_p      = numeric(),
+  ARCH_p    = numeric(),
+  PassDiag  = logical(),
+  stringsAsFactors = FALSE
+)
+
+models_list <- list()
+spec_list   <- list()  
+
+for (name in names(combos)) {
+  spec_def <- combos[[name]]
+  cat("Fitting:", name, "\n")
+  
+  spec <- ugarchspec(
+    variance.model = list(model = spec_def$garch, garchOrder = c(1, 1)),
+    mean.model     = list(
+      armaOrder    = spec_def$arma,
+      include.mean = TRUE,
+      archm        = spec_def$archm,
+      archpow      = spec_def$archpow
+    ),
+    distribution.model = "std"
+  )
+  
+
+  fit <- safe_ugarchfit(spec, sse_train_vec)
+  
+
+  if (is.null(fit)) {
+    spec2 <- apply_starts(spec, spec_def)
+    fit   <- safe_ugarchfit(spec2, sse_train_vec)
+    spec  <- spec2
+  }
+
+  if (is.null(fit)) {
+    cat("  -> FAILED (skipping):", name, "\n")
+    next
+  }
+  
+  models_list[[name]] <- fit
+  spec_list[[name]]   <- spec
+  
+  spec_fixed <- spec
+  setfixed(spec_fixed) <- as.list(coef(fit))
+  
+  filt <- tryCatch(
+    ugarchfilter(spec_fixed, sse_xts),
+    error = function(e) e
+  )
+  if (inherits(filt, "error")) {
+    cat("  -> FILTER FAILED (skipping):", name, "\n")
+    next
+  }
+  
+  pred_all  <- fitted(filt)
+  pred_test <- pred_all[(n_train + 1):n_total]
+  real_test <- sse_test
+  
+  err      <- as.numeric(real_test) - as.numeric(pred_test)
+  rmse_val <- sqrt(mean(err^2, na.rm = TRUE))
+  
+  std_resid <- residuals(fit, standardize = TRUE)
+  std_num   <- as.numeric(std_resid)
+  
+  # Ljung-Box: no remaining serial correlation
+  lb_p <- tryCatch(
+    Box.test(std_num, lag = 10, type = "Ljung-Box")$p.value,
+    error = function(e) NA_real_
+  )
+  
+  # ARCH-LM: no remaining ARCH
+  arch_p <- tryCatch(
+    ArchTest(std_num, lags = 12)$p.value,
+    error = function(e) NA_real_
+  )
+  
+  pass_diag <- (!is.na(lb_p) && !is.na(arch_p) && lb_p > 0.05 && arch_p > 0.05)
+  
+  # Store
+  results <- rbind(
+    results,
+    data.frame(
+      Model    = name,
+      BIC      = infocriteria(fit)[2],
+      RMSE     = rmse_val,
+      LB_p     = lb_p,
+      ARCH_p   = arch_p,
+      PassDiag = pass_diag
+    )
+  )
+}
+
+
+if (nrow(results) < 2) {
+  stop("Too few successful fits. 
+       Consider simplifying the model set or checking the data.")
+}
+
+results_display <- results %>%
+  arrange(desc(PassDiag), BIC, RMSE)
+
+kable(
+  results_display,
+  digits = 6,
+  caption = " Results: Diagnostics-First Selection (Primary) 
+                            + BIC (Tie-Breaker) + RMSE (Secondary)"
+)
+
+# Select winner:
+
+passed <- results %>% filter(PassDiag)
+
+if (nrow(passed) >= 1) {
+  passed <- passed %>% arrange(BIC, RMSE)
+  best_model_name <- passed$Model[1]
+  selection_note <- "Winner chosen as the lowest-BIC model 
+                      among those passing Ljung–Box and ARCH-LM diagnostics."
+} else {
+
+  results_fallback <- results %>% arrange(BIC, RMSE)
+  best_model_name <- results_fallback$Model[1]
+  selection_note <- "No model passed both diagnostics; winner 
+                      chosen by lowest BIC overall (with limitations noted)."
+}
+
+best_fit_obj <- models_list[[best_model_name]]
+best_spec    <- spec_list[[best_model_name]]
+
+cat("\nSelected Model:", best_model_name, "\n")
+cat("Selection rule:", selection_note, "\n")
+```
+
+## 5.1 Final Parameter Estimation (QMLE)
+
+We present the coefficients of the **`r best_model_name`** model. These were estimated jointly (Mean + Variance) using a Student-t likelihood.Robust (Bollerslev–Wooldridge) standard errors correspond to QMLinference.*
+
+```{r final_estimation}
+show(best_fit_obj)
+```
+
+## 5.2 Residual Analysis, ARCH Test and Normality (Final Model)
+
+We confirm the adequacy of the **selected** model by examining the **Standardized Residuals** ($z_t = \epsilon_t / \sigma_t$).
+
+```{r full_model_diagnostics}
+std_resid <- residuals(best_fit_obj, standardize = TRUE)
+std_resid_num <- as.numeric(std_resid)
+
+
+lb_test <- Box.test(std_resid_num, lag = 10, type = "Ljung-Box")
+
+
+arch_test <- ArchTest(std_resid_num, lags = 12)
+
+print(lb_test)
+print(arch_test)
+
+
+par(mfrow = c(1, 2))
+acf(std_resid_num,       main = "ACF of Std. Residuals",        lag.max = 20)
+acf(std_resid_num^2,     main = "ACF of Squared Std. Residual", lag.max = 20)
+par(mfrow = c(1, 1))
+
+# Normality checks
+jb_test <- tseries::jarque.bera.test(std_resid_num)
+print(jb_test)
+
+par(mfrow = c(1, 2))
+hist(std_resid_num, breaks = 30, 
+     main = "Histogram of Std. Residuals", xlab = "z_t")
+qqnorm(std_resid_num, main = "QQ-Plot of Std. Residuals")
+qqline(std_resid_num, col = "red")
+par(mfrow = c(1, 1))
+```
+
+# 6. Dynamic Forecasting (Investment Application)
+
+We perform a final **rolling forecast** (re-estimating parameters approximately once per year) to generate a dynamic volatility signal.
+
+```{r rolling_forecast}
+
+winner_def <- combos[[best_model_name]]
+
+final_spec <- ugarchspec(
+  variance.model = list(model = winner_def$garch, garchOrder = c(1, 1)),
+  mean.model     = list(
+    armaOrder    = winner_def$arma,
+    include.mean = TRUE,
+    archm        = winner_def$archm,
+    archpow      = winner_def$archpow
+  ),
+  distribution.model = "std"
+)
+
+roll_forecast <- ugarchroll(
+  spec         = final_spec,
+  data         = sse_xts,
+  n.ahead      = 1,
+  n.start      = n_train,
+  refit.every  = 250,
+  refit.window = "recursive"
+)
+
+forecast_df <- as.data.frame(roll_forecast)
+```
+
+## 6.1 Performance Review
+
+```{r perf_plot}
+
+dates_test <- index(sse_xts)[(n_train + 1):n_total]
+if (length(forecast_df$Sigma) != length(dates_test)) {
+  dates_test <- tail(dates_test, length(forecast_df$Sigma))
+}
+
+sigma_xts <- xts(forecast_df$Sigma, order.by = dates_test)
+
+par(mar = c(3, 4, 3, 1))
+plot(
+  sigma_xts,
+  main = "Forecasted Volatility (Sigma) vs Returns",
+  col  = "darkred",
+  lwd  = 1.5,
+  ylim = c(-5, 5),
+  yaxis.right = FALSE
+)
+lines(sse_test, col = "gray", lwd = 0.5)
+legend(
+  "topleft",
+  legend = c("Predicted Risk (Sigma)", "Actual Returns"),
+  col    = c("darkred", "gray"),
+  lty    = 1,
+  cex    = 0.8,
+  bty    = "n"
+)
+```
+
+# 7. Executive Summary
+
+Based on the rigorous Train–Test validation:
+
+1. **Stationarity:** ADF testing on the training returns rejects a unit root, so returns are treated as stationary.  
+2. **ARCH Confirmation:** A baseline AR(1) mean model exhibits significant ARCH effects in residuals (ARCH-LM and autocorrelation in squared residuals), motivating GARCH-type volatility modelling.  
+3. **Candidate Set (Course Scope):** Mean candidates {AR(1), MA(1), ARMA(1,1)} are selected by training-set correlograms. Volatility candidates are restricted to GARCH, GJR-GARCH, EGARCH, and GARCH-in-Mean as standard extensions covered in class and commonly used in equity index volatility modelling.  
+4. **Model Selection (Diagnostics-First):** We estimate an assessment of 12 joint Mean–Variance models. We first retain only models that pass checks on standardized residuals (Ljung–Box p-value > 0.05 and ARCH-LM p-value > 0.05). Among those, we select the model with the lowest BIC (parsimony). Test-set RMSE of the conditional mean is reported as a secondary forecast sanity check rather than a primary selection criteria.  
+5. **Final Residual Analysis:** The selected model’s standardized residuals show no material serial correlation and no remaining ARCH effects; squared-residual correlograms do not indicate additional volatility clustering.  
+6. **Robustness:** Normality checks on standardized residuals typically reject strict Normality; we appropriately use QML estimation to estimatie the regression parameters.  
+7. **Forecasting Application:** Rolling 1-step-ahead volatility forecasts (with periodic refits) provide a time-varying risk signal suitable for volatility targeting or risk-based position sizing in an SPFTZ-linked portfolio.
+
+## Limitations
+
+Despite the comprehensive analysis, several limitations remain:
+
+- **Residual mean dynamics.**  
+  The ARMA(1,1) mean equation eliminates most, but not all, serial dependence in returns. We accept this because daily equity index returns are empirically hard to forecast in mean, and our primary objective is accurate **volatility modelling** rather than market timing.
+
+- **Structural breaks and regimes.**  
+  The sample covers multiple crises and policy regimes (e.g. GFC, Covid-19). A single GARCH specification cannot fully capture all such shifts. In practice, a better approach might be to reestimate model parameters using a rolling window approach, capturing changing market dynamics in different regimes.
+
+- **Data quality and extreme observations.**  
+  The dataset contains a few very large single-day moves. The Student-t GARCH framework is robust to such outliers, but they still influence parameter estimates. In a production environment, we would investigate these episodes individually and consider robust estimation or data cleaning rules.
+
+From a business perspective, the key message is that the SSE Composite has **very small average daily drift** but **meaningful and persistent risk**. The daily standard deviation is 1.45%, though the series exhibits fat tails with extreme moves reaching $\pm 9\%$. This means that, while the index is not strongly predictable in direction, **the size of daily moves is highly variable and must be actively managed** using a dynamic volatility estimate rather than a fixed “one number” for risk.
+
