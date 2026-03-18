@@ -8,7 +8,7 @@ get_candidate_models <- function() {
 }
 
 build_spec <- function(spec_def) {
-  ugarchspec(
+  rugarch::ugarchspec(
     variance.model = list(
       model = spec_def$garch,
       garchOrder = c(1, 1)

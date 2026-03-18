@@ -1,12 +1,19 @@
+# src/05_fit_select.R
+
 fit_and_score_model <- function(name, spec_def, sse_train, sse_xts, sse_test, n_train, n_total) {
   spec <- build_spec(spec_def)
   
-  fit <- ugarchfit(spec = spec, data = sse_train, solver = "hybrid")
+  fit <- rugarch::ugarchfit(
+    spec = spec,
+    data = sse_train,
+    solver = "hybrid"
+  )
   
   spec_fixed <- spec
-  setfixed(spec_fixed) <- as.list(coef(fit))
+  # FIX: Removed stats:: to allow proper S4 method dispatch for rugarch objects
+  rugarch::setfixed(spec_fixed) <- as.list(coef(fit))
   
-  filt <- ugarchfilter(spec_fixed, sse_xts)
+  filt <- rugarch::ugarchfilter(spec_fixed, sse_xts)
   
   pred_all  <- fitted(filt)
   pred_test <- pred_all[(n_train + 1):n_total]
@@ -18,7 +25,7 @@ fit_and_score_model <- function(name, spec_def, sse_train, sse_xts, sse_test, n_
   list(
     model_name = name,
     fit = fit,
-    bic = infocriteria(fit)[2],
+    bic = rugarch::infocriteria(fit)[2],
     rmse = rmse_val
   )
 }

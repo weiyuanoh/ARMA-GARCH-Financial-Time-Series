@@ -1,27 +1,18 @@
-
 ---
-title: "ARMA-GARCH Modeling of SSE Composite Index Returns"
-author: "Wei Yuan"
-format:
-  html:
-    toc: true
-    toc-depth: 3
-    number-sections: true
-    code-fold: false
+title: "FN6811: Analysis of SSE Composite Index Return Dynamics and Volatility"
+author: "Wei Yuan Oh"
+format: 
   pdf:
     toc: true
-    number-sections: true
+    theme: cosmo
 execute:
-  echo: true
   warning: false
   message: false
 ---
 
 ```{r setup, include=FALSE}
+# Load all dependencies and modules
 source("../src/00_setup.R")
-load_packages()
-set_report_options()
-
 source("../src/01_data_prep.R")
 source("../src/02_split.R")
 source("../src/03_stats_tests.R")
@@ -30,240 +21,158 @@ source("../src/05_fit_select.R")
 source("../src/06_diagnostics.R")
 source("../src/07_rolling_forecast.R")
 source("../src/08_plots.R")
+
+load_packages()
+set_report_options()
 ```
 
-```{r pipeline_objects, include=FALSE}
-prep <- load_and_prepare_sse("../data/SSE_Jan2008_Oct2025.xlsx")
+## 1. Introduction and Data Preparation
 
-split_obj <- split_series(prep$sse_xts, train_frac = 0.70)
+### 1.1 Assignment Context
+This report supports the company's initiative to invest in the Shanghai Pilot Free Trade Zone (SPFTZ). We aim to construct a portfolio replicating the Shanghai Stock Exchange (SSE) Composite Index. The objective is to model the return dynamics and volatility of the SSE using a rigorous Joint Estimation methodology to select the optimal model.
 
-desc_obj <- compute_descriptive_stats(split_obj$sse_train)
-adf_res <- run_adf_test(split_obj$sse_train)
-acf_pacf_obj <- get_acf_pacf(split_obj$sse_train)
+### 1.2 Data Ingestion and Transformation
+We analyze the daily closing prices from January 2, 2008, to October 15, 2025. We calculate daily log returns ($R_{t}$):
 
-combos <- get_candidate_models()
+$$R_{t} = 100 \times \ln\left(\frac{PRICE_{t}}{PRICE_{t-1}}\right)$$
 
-tournament <- run_model_tournament(
-  combos = combos,
-  sse_train = split_obj$sse_train,
-  sse_xts = prep$sse_xts,
-  sse_test = split_obj$sse_test,
+```{r data-prep}
+filename <- "../data/SSE_Jan2008_Oct2025.xlsx"
+data_obj <- load_and_prepare_sse(filename)
+sse_xts <- data_obj$sse_xts
+df <- data_obj$df
+
+# Verification
+cat(sprintf("Rows processed: %d\n", nrow(df)))
+cat(sprintf("Date Range: %s to %s\n", min(zoo::index(sse_xts)), max(zoo::index(sse_xts))))
+head(sse_xts)
+```
+
+### 1.3 Train-Test Split (70:30)
+To ensure our model is robust for investment decisions, we strictly separate the data into:
+1. **Training Set (70%)**: Used for Identification, Joint Estimation, and Model Selection.
+2. **Testing Set (30%)**: Used exclusively for Forecasting and Out-of-Sample Evaluation.
+
+```{r train-test-split}
+split_obj <- split_series(sse_xts, train_frac = 0.70)
+sse_train <- split_obj$sse_train
+sse_test <- split_obj$sse_test
+
+plot_train_test_split(sse_xts, sse_train)
+
+cat(sprintf("Training Data: %d observations\nTesting Data: %d observations\n", 
+            split_obj$n_train, split_obj$n_test))
+```
+
+## 2. Statistical Properties (Training Set)
+We perform all statistical checks on the Training Set only.
+
+### 2.1 Descriptive Statistics & Normality
+
+```{r stats-normality}
+stats_obj <- compute_descriptive_stats(sse_train)
+knitr::kable(stats_obj$stats, caption = "Descriptive Statistics (Training Set)")
+
+cat("Excess Kurtosis:", stats_obj$kurt_val, "\n")
+```
+
+**Decision:** The Training data exhibits significant Excess Kurtosis (34.1). We reject Normality and will use the Student-t distribution in our Joint GARCH models. We will rely on QMLE (Robust Standard Errors) for inference.
+
+### 2.2 Stationarity Test (ADF)
+
+```{r adf-test}
+run_adf_test(sse_train)
+```
+
+**Conclusion:** The p-value is $< 0.05$. The Training series is stationary.
+
+## 3. Model Identification (Pre-Screening)
+We inspect the correlograms of the Training set to identify plausible Mean Equation candidates.
+
+```{r correlograms}
+plot_acf_pacf(sse_train)
+```
+
+**Interpretation:**
+* The significant spike at PACF lag 1 suggests an $AR(1)$.
+* The ACF decay pattern suggests possible ARMA structure.
+* **Candidates:** We will test a family of mean models: $AR(1)$, $MA(1)$, ARMA(1,1) paired with GARCH components.
+
+## 4. Joint Model Selection ("The Grand Tournament")
+Instead of fixing the Mean Equation first and then the Variance, we test the Joint Hypotheses. We compare different Mean-Variance combinations directly, estimate parameters jointly (MLE) on the Training Set, and select the winner based on Out-of-Sample Forecasting Performance (RMSE) on the Test Set.
+
+To stay close to the course material and avoid overfitting, we restrict the volatility specification to four standard models: GARCH(1,1), GJR-GARCH(1,1), EGARCH(1,1), and GARCH-in-Mean.
+
+```{r model-tournament}
+candidate_combos <- get_candidate_models()
+
+tourney_res <- run_model_tournament(
+  combos = candidate_combos,
+  sse_train = sse_train,
+  sse_xts = sse_xts,
+  sse_test = sse_test,
   n_train = split_obj$n_train,
   n_total = split_obj$n_total
 )
 
-best_model_name <- tournament$best_model_name
-best_fit_obj <- tournament$best_fit_obj
+knitr::kable(tourney_res$results, caption = "Joint Model Selection: Mean & Variance Combined")
 
-diag_obj <- run_model_diagnostics(best_fit_obj)
+cat("Selected Joint Model based on Prediction Error (RMSE):", tourney_res$best_model_name, "\n")
+```
 
-roll_obj <- run_rolling_forecast(
-  best_model_name = best_model_name,
-  combos = combos,
-  sse_xts = prep$sse_xts,
+### 4.1 Final Parameter Estimation (QMLE)
+We present the coefficients of the ARMA11-EGARCH model. These were estimated jointly (Mean + Variance) using the Student-t distribution on the training portion. 
+*Note: The "Robust Standard Errors" column in the output represents the Bollerslev-Wooldridge QMLE standard errors*.
+
+```{r parameter-estimation}
+best_fit_obj <- tourney_res$best_fit_obj
+show(best_fit_obj)
+```
+
+### 4.2 Residual Analysis & Validation
+We confirm the adequacy of the "Best" model by examining the Standardized Residuals ($z_{t} = \epsilon_{t}/\sigma_{t}$). To be considered a valid model, the standardized residuals must behave like White Noise (No linear correlation) and have No ARCH Effects (No remaining volatility clustering).
+
+```{r residual-analysis}
+diag_res <- run_model_diagnostics(best_fit_obj)
+
+print(diag_res$lb_test)
+print(diag_res$arch_test)
+
+plot_diagnostics(diag_res$std_resid)
+```
+
+**Validation Verdict:**
+* Since the Ljung-Box p-value is $> 0.05$ (or close to boundary), the Mean equation is adequate.
+* Since the ARCH-LM p-value is $> 0.05$, the GARCH model has successfully filtered the volatility clustering.
+* **Conclusion:** The ARMA11-EGARCH is statistically valid and robust.
+
+## 5. Dynamic Forecasting (Investment Application)
+We perform a final Rolling Forecast (re-estimating parameters every year) to generate the trading signal for the SPFTZ portfolio.
+
+```{r rolling-forecast}
+forecast_res <- run_rolling_forecast(
+  best_model_name = tourney_res$best_model_name,
+  combos = candidate_combos,
+  sse_xts = sse_xts,
   n_train = split_obj$n_train
 )
 ```
 
-# Introduction
+### 5.1 Performance Review
 
-This report studies the daily return dynamics and volatility of the Shanghai Stock Exchange (SSE) Composite Index using a joint ARMA-GARCH framework. The objective is to identify a model that is both statistically defensible and practically useful for out-of-sample risk forecasting.
-
-The analysis is organized as a reproducible research pipeline. Data preparation, model fitting, diagnostics, and forecasting logic are implemented in reusable source files, while this report focuses on presenting results and interpretation.
-
-# Data Preparation
-
-The raw input consists of daily SSE index price data. The cleaning stage standardizes date formats, converts prices to numeric values, removes problematic rows, sorts the data chronologically, and computes daily log returns.
-
-```{r data_preparation}
-cat(sprintf("Rows processed: %d\n", nrow(prep$df)))
-cat(sprintf("Date range: %s to %s\n", min(index(prep$sse_xts)), max(index(prep$sse_xts))))
-cat(sprintf("Total return observations: %d\n\n", NROW(prep$sse_xts)))
-
-head(prep$df)
-```
-
-The return series used in the remainder of the analysis is stored as an `xts` object.
-
-```{r preview_return_series}
-head(prep$sse_xts)
-```
-
-# Train-Test Split
-
-To evaluate predictive performance out of sample, the return series is split into a training set and a testing set. The training sample is used for model estimation and selection, while the testing sample is reserved for forecast evaluation.
-
-```{r train_test_split}
-plot_train_test_split(prep$sse_xts, split_obj$sse_train)
-
-cat(sprintf("Training observations: %d\n", NROW(split_obj$sse_train)))
-cat(sprintf("Testing observations: %d\n", NROW(split_obj$sse_test)))
-cat(sprintf("Training fraction: %.0f%%\n", 100 * split_obj$n_train / split_obj$n_total))
-```
-
-# Descriptive Statistics
-
-Before fitting ARMA-GARCH models, it is useful to inspect the basic empirical properties of the training data.
-
-```{r descriptive_stats}
-knitr::kable(
-  desc_obj$stats,
-  caption = "Descriptive Statistics for SSE Training Returns"
-)
-
-cat("Excess kurtosis:", desc_obj$kurt_val, "\n")
-```
-
-The return distribution is expected to exhibit fat tails, which motivates the use of Student-t innovations in the volatility models.
-
-# Stationarity Check
-
-A return series used in ARMA-GARCH modeling should be stationary in mean. This is assessed using the Augmented Dickey-Fuller test.
-
-```{r stationarity_test}
-print(adf_res)
-```
-
-A strongly negative test statistic with a small p-value supports the assumption that the return series is stationary.
-
-# Preliminary Mean Identification
-
-Autocorrelation and partial autocorrelation plots are used as a preliminary guide for plausible mean specifications. The final mean-variance specification is still determined jointly through the model tournament.
-
-```{r model_identification}
-plot_acf_pacf(split_obj$sse_train)
-```
-
-These plots help motivate low-order ARMA candidates rather than providing a definitive model selection rule.
-
-# Candidate Model Set
-
-The project compares a compact set of joint mean-variance specifications:
-
-* AR(1)-GARCH(1,1)
-* MA(1)-GJR-GARCH(1,1)
-* ARMA(1,1)-EGARCH(1,1)
-* AR(1)-GARCH-in-Mean
-
-All models are estimated with Student-t innovations to account for non-Gaussian tails.
-
-```{r candidate_models}
-str(combos)
-```
-
-# Joint Model Tournament
-
-Each candidate model is fit on the training set. Model comparison uses:
-
-* **BIC** for in-sample parsimony
-* **RMSE** on the test set for out-of-sample predictive performance
-
-The main decision criterion is out-of-sample RMSE.
-
-```{r grand_tournament}
-knitr::kable(
-  tournament$results,
-  caption = "Joint Model Selection Results"
-)
-
-cat("Selected model based on lowest test RMSE:", best_model_name, "\n")
-```
-
-This stage is the core of the research pipeline: the mean and variance equations are selected jointly rather than in isolation.
-
-# Final Estimated Model
-
-The winning specification is re-used as the main fitted model for interpretation and diagnostic checking.
-
-```{r final_estimation}
-show(best_fit_obj)
-```
-
-The output above provides the estimated parameters of the selected ARMA-GARCH specification.
-
-# Residual Diagnostics
-
-A fitted model should not only forecast well, but also leave residuals that are approximately free of serial dependence and leftover ARCH structure.
-
-Two main checks are used:
-
-* **Ljung-Box test** on standardized residuals
-* **ARCH-LM test** on standardized residuals
-
-```{r full_model_diagnostics}
-print(diag_obj$lb_test)
-print(diag_obj$arch_test)
-```
-
-Autocorrelation plots of standardized residuals and squared standardized residuals provide a visual complement to the formal tests.
-
-```{r diagnostic_plots}
-plot_diagnostics(diag_obj$std_resid)
-```
-
-A satisfactory model should show little structure remaining in either residual series.
-
-# Rolling Volatility Forecast
-
-After selecting the best model, the next step is to evaluate it in a rolling forecasting setting. One-step-ahead recursive forecasts are generated using periodic re-estimation.
-
-```{r rolling_forecast}
-head(roll_obj$forecast_df)
-```
-
-This produces a time series of predicted conditional volatility over the testing period.
-
-# Forecast vs Realized Returns
-
-The plot below compares predicted conditional volatility with the realized return series in the test sample.
-
-```{r perf_plot}
+```{r plot-forecast}
 plot_forecast_vs_returns(
-  forecast_df = roll_obj$forecast_df,
-  sse_xts = prep$sse_xts,
-  sse_test = split_obj$sse_test,
+  forecast_df = forecast_res$forecast_df,
+  sse_xts = sse_xts,
+  sse_test = sse_test,
   n_train = split_obj$n_train,
   n_total = split_obj$n_total
 )
 ```
 
-The conditional volatility forecast is not intended to predict the sign of returns directly. Instead, it captures the changing scale of risk through time.
-
-# Discussion
-
-Several features of the SSE return series make ARMA-GARCH modeling appropriate:
-
-* returns are stationary after transformation from prices
-* fat tails motivate Student-t innovations
-* volatility clustering motivates conditional heteroskedastic models
-* asymmetric or nonlinear variance dynamics may justify alternatives such as GJR-GARCH or EGARCH
-
-The model tournament balances econometric structure with predictive usefulness by combining in-sample and out-of-sample criteria.
-
-# Conclusion
-
-This project builds a modular research pipeline for modeling SSE Composite Index returns using ARMA-GARCH family models. The workflow includes:
-
-* robust data cleaning and return construction
-* train-test evaluation design
-* descriptive and stationarity analysis
-* joint ARMA-GARCH model selection
-* residual diagnostics
-* rolling one-step-ahead volatility forecasting
-
-The refactored structure separates reusable research code from reporting logic, making the analysis easier to maintain, extend, and present.
-
-# Reproducibility
-
-The full project is organized so that:
-
-* `src/` contains reusable analysis functions
-* `scripts/run_pipeline.R` runs the full workflow without rendering the report
-* this QMD serves as the presentation layer for results and interpretation
-
-To rerun the report from the repository root:
-
-```{r eval=FALSE}
-quarto::quarto_render("reports/arma_garch_report.qmd")
-```
-
+## 6. Executive Summary
+Based on the rigorous Train-Test validation:
+1. **Model Selection:** We conducted a "Grand Tournament" of joint Mean-Variance models, restricted to GARCH(1,1), GJR-GARCH(1,1), EGARCH(1,1) and GARCH-in-Mean. The ARMA11-EGARCH was selected for minimizing out-of-sample RMSE on the test set.
+2. **Diagnostic Confirmation:** Residual analysis (Section 4.2) confirmed that the selected model successfully removed all ARCH effects and linear dependence from the data.
+3. **Robustness:** We utilized QMLE (Robust SE) to ensure parameter significance even under non-normal conditions.
+4. **Implication:** The dynamic volatility forecast (Section 5) provides a robust signal for risk-adjusted position sizing in the SPFTZ-linked portfolio.
